@@ -126,6 +126,7 @@ class ProductScraper:
             try:
                 products = await self._do_scrape()
                 if products:
+                    self.save_products(products)
                     self._print_summary(products)
                     return products
                 print(f"⚠️ 第 {attempt}/{max_retries} 次尝试未获取到商品，重试...")
@@ -144,70 +145,108 @@ class ProductScraper:
     # ------------------------------------------------------------------
 
     async def _do_scrape(self):
-        """执行一次完整的抓取流程"""
+        """执行实际的抓取操作"""
         delay = config.SCRAPE_DELAY
         category_keywords = config.SCRAPE_CATEGORY_KEYWORDS
 
-        # 1. 发送 /start 获取主菜单
+        print("📤 发送 /start 命令...")
         await self.client.send_message(self.source_bot, '/start')
         await asyncio.sleep(delay)
 
-        # 2. 获取分类按钮消息
+        print("📥 获取消息...")
         messages = await self.client.get_messages(self.source_bot, limit=5)
+        print(f"📨 收到 {len(messages)} 条消息")
 
         products = []
 
-        # 3. 遍历所有分类按钮
-        for msg in messages:
+        for i, msg in enumerate(messages):
+            print(f"\n--- 消息 {i+1} ---")
+            if msg.text:
+                preview = msg.text[:100] + ('...' if len(msg.text) > 100 else '')
+                print(f"文本: {preview}")
+            print(f"有按钮: {msg.buttons is not None}")
+
+            if msg.buttons:
+                print(f"按钮行数: {len(msg.buttons)}")
+                for row_idx, row in enumerate(msg.buttons):
+                    print(f"  第 {row_idx+1} 行:")
+                    for btn_idx, button in enumerate(row):
+                        print(f"    按钮 {btn_idx+1}: {button.text}")
+
             if not msg.buttons:
                 continue
 
+            # 遍历所有按钮
             for row in msg.buttons:
                 for button in row:
                     button_text = button.text
 
+                    print(f"\n🔍 检查按钮: {button_text}")
+
                     # 跳过返回 / 主菜单按钮
-                    if any(kw in button_text for kw in ['返回', 'Back', 'Menu', '主菜单']):
+                    if any(kw in button_text for kw in ['返回', 'Back', 'Menu', '主菜单', '返回主菜单']):
+                        print(f"  ⏭️  跳过（返回按钮）")
                         continue
 
                     # 识别商品分类按钮
                     if any(kw in button_text for kw in category_keywords):
-                        print(f"📂 点击分类: {button_text}")
+                        print(f"  ✅ 识别为分类按钮，点击中...")
                         try:
                             await button.click()
                         except Exception as e:
-                            print(f"⚠️ 点击分类按钮失败: {e}")
+                            print(f"  ⚠️ 点击分类按钮失败: {e}")
                             continue
                         await asyncio.sleep(delay)
 
-                        # 4. 获取该分类下的商品列表消息
+                        # 获取商品列表
+                        print(f"  📥 获取分类下的商品...")
                         product_msgs = await self.client.get_messages(
-                            self.source_bot, limit=10
+                            self.source_bot, limit=15
                         )
+                        print(f"  📨 收到 {len(product_msgs)} 条商品消息")
 
-                        # 5. 解析所有商品按钮
+                        # 解析商品
+                        category_products = 0
                         for pmsg in product_msgs:
-                            if not pmsg.buttons:
-                                continue
-                            for prow in pmsg.buttons:
-                                for pbtn in prow:
-                                    if any(kw in pbtn.text for kw in ['返回', 'Back', 'Menu', '主菜单']):
-                                        continue
-                                    product = self.parse_button_product(pbtn.text)
-                                    if product:
-                                        products.append(product)
-                                        print(
-                                            f"✅ {product['name']} "
-                                            f"- {product['price']}U "
-                                            f"[{product['stock']}]"
-                                        )
+                            if pmsg.buttons:
+                                print(f"    发现 {len(pmsg.buttons)} 行商品按钮")
+                                for prow in pmsg.buttons:
+                                    for pbtn in prow:
+                                        pbtn_text = pbtn.text
 
-                        # 6. 返回上一级
+                                        # 跳过返回按钮
+                                        if any(kw in pbtn_text for kw in ['返回', 'Back', 'Menu', '主菜单']):
+                                            continue
+
+                                        print(f"      🔍 解析: {pbtn_text}")
+                                        product = self.parse_button_product(pbtn_text)
+                                        if product:
+                                            products.append(product)
+                                            category_products += 1
+                                            print(
+                                                f"      ✅ {product['name']} "
+                                                f"- {product['price']}U "
+                                                f"[{product['stock']}]"
+                                            )
+                                        else:
+                                            print(f"      ❌ 解析失败")
+
+                        print(f"  📦 本分类共抓取 {category_products} 个商品")
+
+                        # 返回主菜单
+                        print(f"  ⬅️  返回主菜单...")
                         await self.go_back_to_main_menu(product_msgs)
                         await asyncio.sleep(delay)
+                    else:
+                        print(f"  ⏭️  跳过（不是分类按钮）")
 
-        # 7. 保存到数据库
-        self.save_products(products)
+        print("\n" + "="*60)
+        print(f"📊 同步统计:")
+        print(f"   总商品数: {len(products)}")
+        print(f"   成功解析: {len([p for p in products if p['price'] > 0])}")
+        print(f"   价格未知: {len([p for p in products if p['price'] == 0])}")
+        print("="*60 + "\n")
+
         return products
 
     # ------------------------------------------------------------------
