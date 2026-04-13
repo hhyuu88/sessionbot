@@ -104,116 +104,292 @@ def init_database():
 # ========================
 
 class ProductScraper:
-    """从源机器人抓取商品信息"""
-    
+    """从源机器人抓取商品信息（支持按钮式菜单）"""
+
     def __init__(self, client, source_bot):
         self.client = client
         self.source_bot = source_bot
-    
+
+    # ------------------------------------------------------------------
+    # 公开入口：带重试机制
+    # ------------------------------------------------------------------
+
     async def scrape_products(self):
-        """
-        抓取源机器人的商品列表
-        
-        实现方式：
-        1. 向源机器人发送 /start 或 /products 命令
-        2. 解析返回的商品列表消息
-        3. 提取商品信息（名称、价格、库存）
-        """
-        print("开始抓取商品信息...")
-        
-        # 向源机器人发送命令
-        await self.client.send_message(self.source_bot, '/products')
-        
-        # 等待响应
-        await asyncio.sleep(2)
-        
-        # 获取最新消息
-        messages = await self.client.get_messages(self.source_bot, limit=10)
-        
+        """抓取商品（带重试机制）"""
+        max_retries = config.SCRAPE_RETRY_COUNT
+
+        print("\n" + "=" * 60)
+        print("🚀 开始商品同步")
+        print("=" * 60)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                products = await self._do_scrape()
+                if products:
+                    self._print_summary(products)
+                    return products
+                print(f"⚠️ 第 {attempt}/{max_retries} 次尝试未获取到商品，重试...")
+                await asyncio.sleep(5)
+            except Exception as e:
+                print(f"❌ 抓取失败 (尝试 {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(5)
+
+        print("❌ 商品抓取失败，已达最大重试次数")
+        print("=" * 60 + "\n")
+        return []
+
+    # ------------------------------------------------------------------
+    # 内部：实际抓取逻辑
+    # ------------------------------------------------------------------
+
+    async def _do_scrape(self):
+        """执行一次完整的抓取流程"""
+        delay = config.SCRAPE_DELAY
+        category_keywords = config.SCRAPE_CATEGORY_KEYWORDS
+
+        # 1. 发送 /start 获取主菜单
+        await self.client.send_message(self.source_bot, '/start')
+        await asyncio.sleep(delay)
+
+        # 2. 获取分类按钮消息
+        messages = await self.client.get_messages(self.source_bot, limit=5)
+
         products = []
-        
-        for message in messages:
-            if not message.text:
+
+        # 3. 遍历所有分类按钮
+        for msg in messages:
+            if not msg.buttons:
                 continue
-            
-            # 解析商品信息（根据源机器人的消息格式调整）
-            product = self.parse_product_message(message.text, message)
-            
-            if product:
-                products.append(product)
-        
-        # 保存到数据库
+
+            for row in msg.buttons:
+                for button in row:
+                    button_text = button.text
+
+                    # 跳过返回 / 主菜单按钮
+                    if any(kw in button_text for kw in ['返回', 'Back', 'Menu', '主菜单']):
+                        continue
+
+                    # 识别商品分类按钮
+                    if any(kw in button_text for kw in category_keywords):
+                        print(f"📂 点击分类: {button_text}")
+                        try:
+                            await button.click()
+                        except Exception as e:
+                            print(f"⚠️ 点击分类按钮失败: {e}")
+                            continue
+                        await asyncio.sleep(delay)
+
+                        # 4. 获取该分类下的商品列表消息
+                        product_msgs = await self.client.get_messages(
+                            self.source_bot, limit=10
+                        )
+
+                        # 5. 解析所有商品按钮
+                        for pmsg in product_msgs:
+                            if not pmsg.buttons:
+                                continue
+                            for prow in pmsg.buttons:
+                                for pbtn in prow:
+                                    if any(kw in pbtn.text for kw in ['返回', 'Back', 'Menu', '主菜单']):
+                                        continue
+                                    product = self.parse_button_product(pbtn.text)
+                                    if product:
+                                        products.append(product)
+                                        print(
+                                            f"✅ {product['name']} "
+                                            f"- {product['price']}U "
+                                            f"[{product['stock']}]"
+                                        )
+
+                        # 6. 返回上一级
+                        await self.go_back_to_main_menu(product_msgs)
+                        await asyncio.sleep(delay)
+
+        # 7. 保存到数据库
         self.save_products(products)
-        
-        print(f"✅ 抓取到 {len(products)} 个商品")
-        
         return products
-    
-    def parse_product_message(self, text, message):
+
+    # ------------------------------------------------------------------
+    # 辅助：返回主菜单
+    # ------------------------------------------------------------------
+
+    async def go_back_to_main_menu(self, messages):
+        """点击返回按钮回到主菜单"""
+        for msg in messages:
+            if not msg.buttons:
+                continue
+            for row in msg.buttons:
+                for button in row:
+                    if '返回' in button.text or 'Back' in button.text:
+                        try:
+                            await button.click()
+                        except Exception as e:
+                            print(f"⚠️ 点击返回按钮失败: {e}")
+                        return
+
+    # ------------------------------------------------------------------
+    # 智能解析：按钮文本 → 商品字典
+    # ------------------------------------------------------------------
+
+    def parse_button_product(self, text):
         """
-        解析商品消息
-        
-        示例消息格式：
-        📦 TikTok 账号
-        💰 价格：$5.00
-        📊 库存：100
-        📝 描述：带粉丝的 TikTok 账号
+        智能解析按钮文本中的商品信息。
+
+        支持格式：
+          1. 加拿大🇨🇦+1 实卡（有密码）- 0.70U [358]
+          2. 🌟【1-8年】协议老号（session+json）[1453]
+          3. TG会员协议老号（session+json）- 1.2U (16)
         """
+        text = text.strip()
+        if not text:
+            return None
+
         try:
-            # 提取商品名称
-            name_match = re.search(r'📦\s*(.+?)\\n', text)
-            name = name_match.group(1).strip() if name_match else None
-            
-            # 提取价格
-            price_match = re.search(r'💰.*?([\\d.]+)', text)
-            price = float(price_match.group(1)) if price_match else None
-            
-            # 提取库存
-            stock_match = re.search(r'📊.*?(\\d+)', text)
-            stock = int(stock_match.group(1)) if stock_match else 0
-            
-            # 提取描述
-            desc_match = re.search(r'📝\\s*描述[：:]\\s*(.+)', text)
-            description = desc_match.group(1).strip() if desc_match else ''
-            
-            if name and price:
+            # 策略1：标准格式 - 名称 - 价格U [库存]
+            m = re.search(r'^(.+?)\s*-\s*([\d.]+)\s*[Uu]\s*\[(\d+)\]', text)
+            if m:
+                return {
+                    'name': m.group(1).strip(),
+                    'price': float(m.group(2)),
+                    'stock': int(m.group(3)),
+                    'description': text,
+                    'source_product_id': str(hash(text)),
+                    'image_url': None,
+                    'last_updated': datetime.now(),
+                }
+
+            # 策略2：名称 [库存] 或 名称 (库存)（价格可能内嵌在名称中）
+            m = re.search(r'^(.+?)\s*[\[\(](\d+)[\]\)]', text)
+            if m:
+                name = m.group(1).strip()
+                stock = int(m.group(2))
+                price_m = re.search(r'([\d.]+)\s*[Uu]', name)
+                if price_m:
+                    price = float(price_m.group(1))
+                    name = re.sub(r'\s*-?\s*[\d.]+\s*[Uu]', '', name).strip()
+                else:
+                    price = 0.0
                 return {
                     'name': name,
                     'price': price,
                     'stock': stock,
-                    'description': description,
-                    'source_product_id': str(hash(name)),  # 生成唯一 ID
-                    'image_url': None,  # 如果消息有图片，提取 URL
-                    'last_updated': datetime.now()
+                    'description': text,
+                    'source_product_id': str(hash(text)),
+                    'image_url': None,
+                    'last_updated': datetime.now(),
                 }
-        
+
+            # 策略3：宽松模式 — 从文本中提取所有数字
+            # 假设：含小数点的数字是价格，大于 _STOCK_MIN 的整数是库存
+            _STOCK_MIN = 10           # 低于此值的整数不视为库存（避免误判年份、区号等）
+            _MAX_FALLBACK_NAME_LEN = 50  # 兜底名称最大截断长度
+            numbers = re.findall(r'[\d.]+', text)
+            if numbers:
+                price = 0.0
+                stock = 0
+                for num in numbers:
+                    if '.' in num:
+                        try:
+                            price = float(num)
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            num_int = int(num)
+                            if num_int > _STOCK_MIN:
+                                stock = num_int
+                        except ValueError:
+                            pass
+                if stock > 0:
+                    name = re.sub(r'[\d.]+', '', text)
+                    # 移除标点及价格单位字符（U/u/Ｕ 为全角/半角 USDT 单位）
+                    name = re.sub(r'[-\[\]()\uFF35Uu]', '', name).strip()
+                    return {
+                        'name': name if name else text[:_MAX_FALLBACK_NAME_LEN],
+                        'price': price,
+                        'stock': stock,
+                        'description': text,
+                        'source_product_id': str(hash(text)),
+                        'image_url': None,
+                        'last_updated': datetime.now(),
+                    }
+
         except Exception as e:
-            print(f"解析商品失败: {e}")
-        
+            print(f"⚠️ 解析商品异常: {e} | 文本: {text}")
+
+        print(f"⚠️ 无法解析: {text}")
         return None
-    
+
+    # ------------------------------------------------------------------
+    # 保存到数据库（INSERT 新商品 / UPDATE 已有商品）
+    # ------------------------------------------------------------------
+
     def save_products(self, products):
-        """保存商品到数据库"""
-        conn = sqlite3.connect('shop_proxy.db')
+        """保存商品到数据库（去重：已存在则更新，不存在则插入）"""
+        conn = sqlite3.connect(config.DATABASE_PATH)
         c = conn.cursor()
-        
+
+        saved_count = 0
+        duplicate_count = 0
+
         for product in products:
-            c.execute('''
-                INSERT OR REPLACE INTO products 
-                (source_product_id, name, description, price, stock, image_url, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                product['source_product_id'],
-                product['name'],
-                product['description'],
-                product['price'],
-                product['stock'],
-                product['image_url'],
-                product['last_updated']
-            ))
-        
+            c.execute(
+                'SELECT id FROM products WHERE source_product_id = ?',
+                (product['source_product_id'],)
+            )
+            existing = c.fetchone()
+
+            if existing:
+                c.execute(
+                    '''UPDATE products
+                       SET name=?, description=?, price=?, stock=?, last_updated=?
+                       WHERE source_product_id=?''',
+                    (
+                        product['name'],
+                        product['description'],
+                        product['price'],
+                        product['stock'],
+                        product['last_updated'],
+                        product['source_product_id'],
+                    ),
+                )
+                duplicate_count += 1
+            else:
+                c.execute(
+                    '''INSERT INTO products
+                       (source_product_id, name, description, price, stock, image_url, last_updated)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    (
+                        product['source_product_id'],
+                        product['name'],
+                        product['description'],
+                        product['price'],
+                        product['stock'],
+                        product['image_url'],
+                        product['last_updated'],
+                    ),
+                )
+                saved_count += 1
+
         conn.commit()
         conn.close()
+
+        print(f"💾 保存: {saved_count} 个新商品, 更新: {duplicate_count} 个")
+
+    # ------------------------------------------------------------------
+    # 统计摘要
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _print_summary(products):
+        priced = [p for p in products if p['price'] > 0]
+        unpriced = [p for p in products if p['price'] == 0]
+        print("\n📊 同步统计:")
+        print(f"   总商品数: {len(products)}")
+        print(f"   成功解析: {len(priced)}")
+        print(f"   价格未知: {len(unpriced)}")
+        print("=" * 60 + "\n")
 
 # ========================
 # 2. 你的销售机器人
