@@ -24,6 +24,15 @@ import json
 import config
 from inventory_manager import InventoryManager, upgrade_database
 from stock_sync_optimizer import StockSyncOptimizer
+from buyer_account_manager import (
+    upgrade_buyer_account_db,
+    run_account_monitor,
+)
+from balance_manager import (
+    upgrade_balance_db,
+    run_balance_monitor,
+)
+from admin_panel import AdminPanel
 
 # ========================
 # 配置（从 config.py 读取，支持环境变量覆盖）
@@ -85,6 +94,10 @@ def init_database():
 
     # 升级 schema：添加库存管理所需的字段和表
     upgrade_database()
+    # 升级 schema：添加管理员操作日志和账号状态记录表
+    upgrade_buyer_account_db()
+    # 升级 schema：添加充值记录表
+    upgrade_balance_db()
 
 # ========================
 # 1. 商品信息克隆模块
@@ -616,7 +629,13 @@ async def main():
 
     # ---- 库存管理器（共享单例，带管理员通知回调）----
     async def notify_admin(message: str):
-        if config.ADMIN_TELEGRAM_ID:
+        if config.ADMIN_IDS:
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await bot_client.send_message(admin_id, message)
+                except Exception as e:
+                    print(f"[通知] 发送管理员消息失败 (ID={admin_id}): {e}")
+        elif config.ADMIN_TELEGRAM_ID:
             try:
                 await bot_client.send_message(config.ADMIN_TELEGRAM_ID, message)
             except Exception as e:
@@ -631,6 +650,15 @@ async def main():
     shop_bot = YourShopBot(bot_client, inventory_manager=inventory)
     purchaser = AutoPurchaser(buyer_client, SOURCE_BOT_USERNAME, inventory_manager=inventory)
     sync_optimizer = StockSyncOptimizer(scraper, inventory)
+
+    # 初始化管理员后台
+    admin_panel = AdminPanel(
+        bot_client=bot_client,
+        buyer_client=buyer_client,
+        source_bot=SOURCE_BOT_USERNAME,
+        notify_callback=notify_admin,
+    )
+    await admin_panel.register_handlers()
     
     # 启动销售机器人
     await shop_bot.start()
@@ -664,6 +692,10 @@ async def main():
     asyncio.create_task(sync_optimizer.run_sync_loop())  # 智能增量同步
     asyncio.create_task(process_orders())
     asyncio.create_task(release_expired_locks())
+    # 代购账号状态监控（每小时检查一次）
+    asyncio.create_task(run_account_monitor(buyer_client, SOURCE_BOT_USERNAME, notify_admin))
+    # 余额监控（每 30 分钟检查一次）
+    asyncio.create_task(run_balance_monitor(buyer_client, SOURCE_BOT_USERNAME, notify_admin))
     
     print("所有模块已启动，系统运行中...")
     
