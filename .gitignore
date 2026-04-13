@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 *.db
 *.session
+
+# 环境变量配置（含敏感信息，不提交到 Git）
+.env
