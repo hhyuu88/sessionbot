@@ -21,30 +21,28 @@ import re
 from datetime import datetime
 import json
 
+import config
+from inventory_manager import InventoryManager, upgrade_database
+from stock_sync_optimizer import StockSyncOptimizer
+
 # ========================
-# 配置
+# 配置（从 config.py 读取，支持环境变量覆盖）
 # ========================
-
-# 你的 Telegram API
-API_ID = '2040'
-API_HASH = 'b18441a1ff607e10a989891a5462e627'
-
-# 机器人配置
-YOUR_BOT_TOKEN = 'YOUR_BOT_TOKEN'  # 你的销售机器人 token
-SOURCE_BOT_USERNAME = '@source_shop_bot'  # 源号铺机器人
-BUYER_ACCOUNT_SESSION = 'buyer_account'  # 代购账号的 session
-
-# 加价策略
-MARKUP_PERCENTAGE = 0.20  # 加价 20%
-MARKUP_FIXED = 5  # 或固定加价 5 元
+API_ID = config.API_ID
+API_HASH = config.API_HASH
+YOUR_BOT_TOKEN = config.YOUR_BOT_TOKEN
+SOURCE_BOT_USERNAME = config.SOURCE_BOT_USERNAME
+BUYER_ACCOUNT_SESSION = config.BUYER_ACCOUNT_SESSION
+MARKUP_PERCENTAGE = config.MARKUP_PERCENTAGE
+MARKUP_FIXED = config.MARKUP_FIXED
 
 # ========================
 # 数据库初始化
 # ========================
 
 def init_database():
-    """初始化数据库"""
-    conn = sqlite3.connect('shop_proxy.db')
+    """初始化数据库（含库存管理所需的升级）"""
+    conn = sqlite3.connect(config.DATABASE_PATH)
     c = conn.cursor()
     
     # 商品表
@@ -84,6 +82,9 @@ def init_database():
     
     conn.commit()
     conn.close()
+
+    # 升级 schema：添加库存管理所需的字段和表
+    upgrade_database()
 
 # ========================
 # 1. 商品信息克隆模块
@@ -208,8 +209,9 @@ class ProductScraper:
 class YourShopBot:
     """你的销售机器人"""
     
-    def __init__(self, client):
+    def __init__(self, client, inventory_manager: InventoryManager = None):
         self.client = client
+        self.inventory = inventory_manager or InventoryManager()
     
     async def start(self):
         """启动机器人"""
@@ -278,9 +280,19 @@ class YourShopBot:
             product_id = int(event.data.decode().split('_')[1])
             user_id = event.sender_id
             username = event.sender.username
-            
+
+            # 实时库存检查（下单前）
+            available = self.inventory.get_available_stock(product_id)
+            if available <= 0:
+                await event.answer("抱歉，该商品库存不足，无法下单！", alert=True)
+                return
+
             # 创建订单
-            order_id = self.create_order(user_id, username, product_id)
+            order_id, error = self.create_order(user_id, username, product_id)
+
+            if error:
+                await event.answer(f"下单失败：{error}", alert=True)
+                return
             
             await event.answer("订单已创建！")
             await event.edit(
@@ -296,11 +308,11 @@ class YourShopBot:
         print("销售机器人已启动")
     
     def get_products_with_markup(self):
-        """获取加价后的商品列表"""
-        conn = sqlite3.connect('shop_proxy.db')
+        """获取加价后的商品列表（仅展示上架且有库存的商品）"""
+        conn = sqlite3.connect(config.DATABASE_PATH)
         c = conn.cursor()
         
-        c.execute('SELECT * FROM products WHERE stock > 0')
+        c.execute("SELECT * FROM products WHERE stock > 0 AND status = 'active'")
         products = []
         
         for row in c.fetchall():
@@ -318,7 +330,7 @@ class YourShopBot:
     
     def get_product(self, product_id):
         """获取单个商品"""
-        conn = sqlite3.connect('shop_proxy.db')
+        conn = sqlite3.connect(config.DATABASE_PATH)
         c = conn.cursor()
         
         c.execute('SELECT * FROM products WHERE id = ?', (product_id,))
@@ -339,33 +351,47 @@ class YourShopBot:
         return None
     
     def create_order(self, user_id, username, product_id):
-        """创建订单"""
+        """
+        创建订单并锁定库存
+
+        :return: (order_id, error_message) — 成功时 error_message 为 None
+        """
+        from inventory_manager import get_db as _get_db
+
         product = self.get_product(product_id)
-        
-        conn = sqlite3.connect('shop_proxy.db')
-        c = conn.cursor()
-        
-        c.execute('''
-            INSERT INTO orders 
-            (user_id, username, product_id, quantity, total_price, cost_price, profit, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id,
-            username,
-            product_id,
-            1,
-            product['price'],
-            product['cost_price'],
-            product['price'] - product['cost_price'],
-            'pending',
-            datetime.now()
-        ))
-        
-        order_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        
-        return order_id
+        if not product:
+            return None, '商品不存在'
+
+        with _get_db() as conn:
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO orders 
+                (user_id, username, product_id, quantity, total_price, cost_price, profit, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id,
+                username,
+                product_id,
+                1,
+                product['price'],
+                product['cost_price'],
+                product['price'] - product['cost_price'],
+                'pending',
+                datetime.now()
+            ))
+            order_id = c.lastrowid
+
+        # 锁定库存（二次确认）
+        locked = self.inventory.lock_stock(product_id, order_id, quantity=1)
+        if not locked:
+            # 无法锁定库存，取消订单
+            with _get_db() as conn:
+                conn.cursor().execute(
+                    "UPDATE orders SET status = 'failed' WHERE id = ?", (order_id,)
+                )
+            return None, '库存不足，下单失败'
+
+        return order_id, None
 
 # ========================
 # 3. 自动代购模块（核心）
@@ -374,9 +400,10 @@ class YourShopBot:
 class AutoPurchaser:
     """自动代购模块"""
     
-    def __init__(self, client, source_bot):
+    def __init__(self, client, source_bot, inventory_manager: InventoryManager = None):
         self.client = client
         self.source_bot = source_bot
+        self.inventory = inventory_manager or InventoryManager()
     
     async def purchase_for_order(self, order_id):
         """
@@ -410,12 +437,15 @@ class AutoPurchaser:
             
             if not account_info:
                 self.update_order_status(order_id, 'failed')
+                # 代购失败，释放库存锁定
+                self.inventory.release_lock(order_id, product_id=order['product_id'])
                 return False
             
             # 步骤3: 转发给用户
             await self.deliver_to_user(order, account_info)
             
-            # 步骤4: 完成订单
+            # 步骤4: 完成订单，永久扣减库存
+            self.inventory.confirm_purchase(order_id, order['product_id'], quantity=1)
             self.update_order_status(order_id, 'completed')
             self.save_account_info(order_id, account_info)
             
@@ -425,6 +455,8 @@ class AutoPurchaser:
         except Exception as e:
             print(f"❌ 订单 {order_id} 处理失败: {e}")
             self.update_order_status(order_id, 'failed')
+            # 代购异常，释放库存锁定
+            self.inventory.release_lock(order_id, product_id=order['product_id'])
             return False
     
     async def place_order_at_source(self, order):
@@ -509,7 +541,7 @@ class AutoPurchaser:
     
     def get_order(self, order_id):
         """获取订单"""
-        conn = sqlite3.connect('shop_proxy.db')
+        conn = sqlite3.connect(config.DATABASE_PATH)
         c = conn.cursor()
         
         c.execute('''
@@ -538,7 +570,7 @@ class AutoPurchaser:
     
     def update_order_status(self, order_id, status):
         """更新订单状态"""
-        conn = sqlite3.connect('shop_proxy.db')
+        conn = sqlite3.connect(config.DATABASE_PATH)
         c = conn.cursor()
         
         c.execute('UPDATE orders SET status = ? WHERE id = ?', (status, order_id))
@@ -551,7 +583,7 @@ class AutoPurchaser:
     
     def save_account_info(self, order_id, account_info):
         """保存账号信息"""
-        conn = sqlite3.connect('shop_proxy.db')
+        conn = sqlite3.connect(config.DATABASE_PATH)
         c = conn.cursor()
         
         c.execute(
@@ -569,7 +601,7 @@ class AutoPurchaser:
 async def main():
     """主程序"""
     
-    # 初始化数据库
+    # 初始化数据库（含库存管理 schema 升级）
     init_database()
     
     # 创建客户端（代购账号）
@@ -581,30 +613,33 @@ async def main():
     await bot_client.start(bot_token=YOUR_BOT_TOKEN)
     
     print("系统已启动")
-    
+
+    # ---- 库存管理器（共享单例，带管理员通知回调）----
+    async def notify_admin(message: str):
+        if config.ADMIN_TELEGRAM_ID:
+            try:
+                await bot_client.send_message(config.ADMIN_TELEGRAM_ID, message)
+            except Exception as e:
+                print(f"[通知] 发送管理员消息失败: {e}")
+        else:
+            print(f"[通知] {message}")
+
+    inventory = InventoryManager(notify_callback=notify_admin)
+
     # 初始化模块
     scraper = ProductScraper(buyer_client, SOURCE_BOT_USERNAME)
-    shop_bot = YourShopBot(bot_client)
-    purchaser = AutoPurchaser(buyer_client, SOURCE_BOT_USERNAME)
+    shop_bot = YourShopBot(bot_client, inventory_manager=inventory)
+    purchaser = AutoPurchaser(buyer_client, SOURCE_BOT_USERNAME, inventory_manager=inventory)
+    sync_optimizer = StockSyncOptimizer(scraper, inventory)
     
     # 启动销售机器人
     await shop_bot.start()
-    
-    # 定时抓取商品（每小时一次）
-    async def sync_products():
-        while True:
-            try:
-                await scraper.scrape_products()
-            except Exception as e:
-                print(f"抓取商品失败: {e}")
-            
-            await asyncio.sleep(3600)  # 1 小时
     
     # 监控待处理订单
     async def process_orders():
         while True:
             # 查询已支付但未处理的订单
-            conn = sqlite3.connect('shop_proxy.db')
+            conn = sqlite3.connect(config.DATABASE_PATH)
             c = conn.cursor()
             c.execute('SELECT id FROM orders WHERE status = ?', ('paid',))
             orders = c.fetchall()
@@ -615,10 +650,20 @@ async def main():
                 await purchaser.purchase_for_order(order_id)
             
             await asyncio.sleep(30)  # 每 30 秒检查一次
+
+    # 超时库存锁释放（每分钟检查一次）
+    async def release_expired_locks():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await inventory.release_expired_locks()
+            except Exception as e:
+                print(f"[锁释放] 异常: {e}")
     
     # 启动后台任务
-    asyncio.create_task(sync_products())
+    asyncio.create_task(sync_optimizer.run_sync_loop())  # 智能增量同步
     asyncio.create_task(process_orders())
+    asyncio.create_task(release_expired_locks())
     
     print("所有模块已启动，系统运行中...")
     
