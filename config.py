@@ -30,8 +30,9 @@ def _require_env(name: str, default: str | None = None) -> str:
 # ========================
 # Telegram API 配置（必须设置）
 # ========================
-API_ID = _require_env('API_ID', os.environ.get('TG_API_ID'))
-API_HASH = _require_env('API_HASH', os.environ.get('TG_API_HASH'))
+# 支持新变量名 API_ID 和旧变量名 TG_API_ID（向后兼容）
+API_ID = os.environ.get('API_ID') or _require_env('TG_API_ID')
+API_HASH = os.environ.get('API_HASH') or _require_env('TG_API_HASH')
 
 # 机器人配置
 YOUR_BOT_TOKEN = _require_env('BOT_TOKEN')

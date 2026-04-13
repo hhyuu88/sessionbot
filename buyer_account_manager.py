@@ -225,8 +225,8 @@ class BuyerAccountLoginManager:
     # 登录超时（秒）
     LOGIN_TIMEOUT = 300
 
-    def __init__(self, api_id: str, api_hash: str):
-        self.api_id = api_id
+    def __init__(self, api_id: str | int, api_hash: str):
+        self.api_id = int(api_id)
         self.api_hash = api_hash
 
     # ------------------------------------------------------------------
@@ -303,8 +303,9 @@ class BuyerAccountLoginManager:
     async def _handle_phone(self, event, admin_id: int, phone: str):
         session = self._sessions[admin_id]
 
-        # 基本格式校验
-        if not phone.startswith('+') or not phone[1:].isdigit() or len(phone) < 8:
+        # 基本格式校验（剥离非数字字符后验证）
+        digits_only = re.sub(r'[\s\-\(\)]', '', phone[1:])
+        if not phone.startswith('+') or not digits_only.isdigit() or len(digits_only) < 7:
             await event.respond(
                 "❌ 手机号格式不正确，请重新输入（例如：+8613812345678）"
             )

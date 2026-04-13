@@ -154,8 +154,8 @@ def _parse_balance_from_text(text: str) -> Optional[float]:
                 return float(m.group(1))
             except ValueError:
                 pass
-    # 兜底：寻找第一个浮点数
-    m = re.search(r'([\d]+\.[\d]+)', text)
+    # 兜底：寻找第一个浮点数或整数
+    m = re.search(r'([\d]+(?:\.[\d]+)?)', text)
     if m:
         try:
             return float(m.group(1))
@@ -200,7 +200,9 @@ async def recharge_to_source_bot(
 
     :return: True 表示充值成功
     """
-    record_id = _create_recharge_record(amount, 0.0, 'pending')
+    # 查询当前余额用于记录
+    balance_before = await get_source_bot_balance(buyer_client, source_bot) or 0.0
+    record_id = _create_recharge_record(amount, balance_before, 'pending')
 
     future: asyncio.Future = asyncio.get_event_loop().create_future()
 
@@ -282,6 +284,10 @@ def _extract_payment_info(text: str) -> Optional[dict]:
     return None
 
 
+# 充值到账确认容差（允许 5% 的误差，例如手续费）
+_RECHARGE_CONFIRMATION_TOLERANCE = 0.95
+
+
 async def _wait_for_recharge_confirmation(
     buyer_client: TelegramClient,
     source_bot: str,
@@ -295,7 +301,7 @@ async def _wait_for_recharge_confirmation(
     while asyncio.get_event_loop().time() < end_time:
         await asyncio.sleep(30)
         new_balance = await get_source_bot_balance(buyer_client, source_bot)
-        if new_balance is not None and new_balance >= initial_balance + expected_amount * 0.95:
+        if new_balance is not None and new_balance >= initial_balance + expected_amount * _RECHARGE_CONFIRMATION_TOLERANCE:
             return True
 
     return False

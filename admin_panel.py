@@ -277,8 +277,9 @@ class AdminPanel:
 
         @self.bot.on(events.NewMessage)
         async def catch_all_messages(event):
-            """捕获登录流程中的消息"""
+            """捕获登录流程中的消息（仅处理管理员消息）"""
             admin_id = event.sender_id
+            # 仅处理已配置的管理员消息，忽略普通用户
             if admin_id not in config.ADMIN_IDS:
                 return
 
