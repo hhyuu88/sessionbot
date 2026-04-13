@@ -93,3 +93,20 @@ BALANCE_CHECK_INTERVAL = int(os.environ.get('BALANCE_CHECK_INTERVAL', str(30 * 6
 
 # 代购账号状态检查间隔（秒），默认 1 小时
 ACCOUNT_STATUS_CHECK_INTERVAL = int(os.environ.get('ACCOUNT_STATUS_CHECK_INTERVAL', str(60 * 60)))
+
+# ========================
+# 商品抓取配置
+# ========================
+
+# 抓取失败最大重试次数
+SCRAPE_RETRY_COUNT = int(os.environ.get('SCRAPE_RETRY_COUNT', '3'))
+
+# 按钮点击后等待响应的延迟（秒）
+SCRAPE_DELAY = int(os.environ.get('SCRAPE_DELAY', '3'))
+
+# 商品分类识别关键词（逗号分隔）
+SCRAPE_CATEGORY_KEYWORDS: list[str] = [
+    stripped
+    for kw in os.environ.get('SCRAPE_CATEGORY_KEYWORDS', 'TG,协议,老号,session').split(',')
+    if (stripped := kw.strip())
+]
